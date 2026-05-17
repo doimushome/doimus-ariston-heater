@@ -1,0 +1,57 @@
+{
+  "pluginAlias": "AristonHeater",
+  "pluginType": "platform",
+  "headerDisplay": "Ariston NET Velis/Lydos water heater. Uses cloud API to read/set temperature and power.",
+  "footerDisplay": "Tip: If the device behaves oddly, delete ariston-heater-cache.json from the plugin data path to force re-detection of the API variant.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "title": "Name",
+        "type": "string",
+        "default": "Ariston Heater"
+      },
+      "username": {
+        "title": "Ariston Username (Email)",
+        "type": "string"
+      },
+      "password": {
+        "title": "Ariston Password",
+        "type": "string",
+        "format": "password"
+      },
+      "gateway": {
+        "title": "Plant ID (optional)",
+        "type": "string",
+        "description": "If empty, auto-discovers the first available Velis/Lydos device."
+      },
+      "pollInterval": {
+        "title": "Poll Interval (seconds)",
+        "type": "number",
+        "default": 1800,
+        "minimum": 300,
+        "description": "How often to refresh state from the cloud. Minimum 300 (5 min), default 1800 (30 min)."
+      },
+      "minTemp": {
+        "title": "Minimum Target Temperature (°C)",
+        "type": "number",
+        "default": 40,
+        "minimum": 1,
+        "maximum": 80
+      },
+      "maxTemp": {
+        "title": "Maximum Target Temperature (°C)",
+        "type": "number",
+        "default": 65,
+        "minimum": 2,
+        "maximum": 80
+      },
+      "debug": {
+        "title": "Enable Debug Logging",
+        "type": "boolean",
+        "default": false
+      }
+    },
+    "required": ["name", "username", "password"]
+  }
+}
