@@ -48,7 +48,7 @@ module.exports = {
       name: config.name || "Ariston Heater",
       type: "thermostat",
       capabilities: ["temperature", "target_temp", "heating_state", "heating_mode"],
-      state: { temperature: 0, target_temp: minTemp, heating_state: 0, heating_mode: 0 },
+      state: { temperature: 0, target_temp: minTemp, heating_state: 0, heating_mode: 0, min_target_temp: minTemp, max_target_temp: maxTemp },
     });
 
     api.onCommand((id, key, value) => {
@@ -154,6 +154,7 @@ function updateState(data) {
 
 async function setTargetTemp(newTemp) {
   if (!client) return;
+  newTemp = Math.max(minTemp, Math.min(maxTemp, newTemp));
   const oldTemp = cached.target_temp || minTemp;
   apiRef.log("info", "Setting temperature: " + oldTemp + "C -> " + newTemp + "C");
 
