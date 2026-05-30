@@ -4,7 +4,7 @@ const fsp = fs.promises;
 
 class VariantStorage {
   constructor(baseDir, log) {
-    this.file = path.join(baseDir || process.cwd(), "ariston-heater-cache.json");
+    this.file = path.join(baseDir || process.cwd(), "data", "persist", "ariston-heater-cache.json");
     this.cache = { variants: {} };
     this.log = log || { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} };
   }
