@@ -3,6 +3,7 @@ const { AristonClient } = require("./client");
 let client = null;
 let deviceId = null;
 let pollTimer = null;
+let retryTimer = null;
 let refreshInFlight = null;
 let consecutiveFailures = 0;
 let config = {};
@@ -15,9 +16,11 @@ function generateUUID(seed) {
   const crypto = require("crypto");
   const hash = crypto.createHash("sha256").update(seed).digest("hex");
   return [
-    hash.substring(0, 8), hash.substring(8, 12),
+    hash.substring(0, 8),
+    hash.substring(8, 12),
     "5" + hash.substring(12, 15),
-    ((parseInt(hash.substring(15, 17), 16) & 0x3f) | 0x80).toString(16) + hash.substring(17, 19),
+    ((parseInt(hash.substring(15, 17), 16) & 0x3f) | 0x80).toString(16) +
+      hash.substring(17, 19),
     hash.substring(19, 31),
   ].join("-");
 }
@@ -38,7 +41,14 @@ module.exports = {
     client = new AristonClient({
       username: config.username,
       password: config.password,
-      log: { info: (m) => api.log("info", m), warn: (m) => api.log("warn", m), error: (m) => api.log("error", m), debug: (m) => { if (debug) api.log("debug", m); } },
+      log: {
+        info: (m) => api.log("info", m),
+        warn: (m) => api.log("warn", m),
+        error: (m) => api.log("error", m),
+        debug: (m) => {
+          if (debug) api.log("debug", m);
+        },
+      },
       debug,
       cacheDir: process.cwd(),
     });
@@ -47,8 +57,20 @@ module.exports = {
       id: deviceId,
       name: config.name || "Ariston Heater",
       type: "thermostat",
-      capabilities: ["temperature", "target_temp", "heating_state", "heating_mode"],
-      state: { temperature: 0, target_temp: minTemp, heating_state: 0, heating_mode: 0, min_target_temp: minTemp, max_target_temp: maxTemp },
+      capabilities: [
+        "temperature",
+        "target_temp",
+        "heating_state",
+        "heating_mode",
+      ],
+      state: {
+        temperature: 0,
+        target_temp: minTemp,
+        heating_state: 0,
+        heating_mode: 0,
+        min_target_temp: minTemp,
+        max_target_temp: maxTemp,
+      },
     });
 
     api.onCommand((id, key, value) => {
@@ -65,9 +87,84 @@ module.exports = {
     initialize(pollInterval);
   },
 
+  setConfig(cfg) {
+    config = cfg;
+
+    // Cancel any pending retry or poll
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+
+    // Reset state
+    consecutiveFailures = 0;
+    refreshInFlight = null;
+
+    // Recompute config-derived values
+    minTemp = Math.max(1, Number(config.minTemp ?? 40));
+    maxTemp = Math.max(minTemp + 1, Number(config.maxTemp ?? 65));
+    const pollInterval = Math.max(300, Number(config.pollInterval) || 1800);
+    const debug = !!config.debug;
+
+    // Recreate device ID in case gateway/username changed
+    const seed = "ariston-heater-" + (config.gateway || config.username);
+    deviceId = generateUUID(seed);
+
+    // Create new client with updated credentials
+    client = new AristonClient({
+      username: config.username,
+      password: config.password,
+      log: {
+        info: (m) => apiRef.log("info", m),
+        warn: (m) => apiRef.log("warn", m),
+        error: (m) => apiRef.log("error", m),
+        debug: (m) => {
+          if (debug) apiRef.log("debug", m);
+        },
+      },
+      debug,
+      cacheDir: process.cwd(),
+    });
+
+    // Re-register device with potentially new config values
+    apiRef.registerDevice({
+      id: deviceId,
+      name: config.name || "Ariston Heater",
+      type: "thermostat",
+      capabilities: [
+        "temperature",
+        "target_temp",
+        "heating_state",
+        "heating_mode",
+      ],
+      state: {
+        temperature: 0,
+        target_temp: minTemp,
+        heating_state: 0,
+        heating_mode: 0,
+        min_target_temp: minTemp,
+        max_target_temp: maxTemp,
+      },
+    });
+
+    initialize(pollInterval);
+  },
+
   stop() {
-    if (pollTimer) clearInterval(pollTimer);
+    if (retryTimer) {
+      clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
     pollTimer = null;
+    retryTimer = null;
     client = null;
   },
 };
@@ -90,13 +187,16 @@ async function initialize(pollInterval) {
     apiRef.log("info", "Using variant: " + variant);
 
     await refresh(plantId, variant);
-    pollTimer = setInterval(() => refresh(plantId, variant), pollInterval * 1000);
+    pollTimer = setInterval(
+      () => refresh(plantId, variant),
+      pollInterval * 1000,
+    );
     if (pollTimer.unref) pollTimer.unref();
 
     apiRef.log("info", "Device ready");
   } catch (e) {
     apiRef.log("error", "Initialization failed: " + e.message);
-    setTimeout(() => initialize(pollInterval), 60000);
+    retryTimer = setTimeout(() => initialize(pollInterval), 60000);
   }
 }
 
@@ -112,7 +212,10 @@ async function refresh(plantId, variant) {
         consecutiveFailures = 0;
       } else {
         consecutiveFailures++;
-        apiRef.log("warn", "Failed to get data (attempt " + consecutiveFailures + ")");
+        apiRef.log(
+          "warn",
+          "Failed to get data (attempt " + consecutiveFailures + ")",
+        );
       }
     } catch (e) {
       consecutiveFailures++;
@@ -156,7 +259,10 @@ async function setTargetTemp(newTemp) {
   if (!client) return;
   newTemp = Math.max(minTemp, Math.min(maxTemp, newTemp));
   const oldTemp = cached.target_temp || minTemp;
-  apiRef.log("info", "Setting temperature: " + oldTemp + "C -> " + newTemp + "C");
+  apiRef.log(
+    "info",
+    "Setting temperature: " + oldTemp + "C -> " + newTemp + "C",
+  );
 
   cached.target_temp = newTemp;
   apiRef.updateDeviceState(deviceId, { target_temp: newTemp });
@@ -197,7 +303,10 @@ async function setPower(on) {
 
   const prev = cached.heating_state;
   cached.heating_state = on ? 1 : 0;
-  apiRef.updateDeviceState(deviceId, { heating_state: cached.heating_state, heating_mode: cached.heating_state });
+  apiRef.updateDeviceState(deviceId, {
+    heating_state: cached.heating_state,
+    heating_mode: cached.heating_state,
+  });
 
   try {
     await client.login();
@@ -214,12 +323,18 @@ async function setPower(on) {
       setTimeout(() => refreshIfReady(pid, v), 5000);
     } else {
       cached.heating_state = prev;
-      apiRef.updateDeviceState(deviceId, { heating_state: prev, heating_mode: prev });
+      apiRef.updateDeviceState(deviceId, {
+        heating_state: prev,
+        heating_mode: prev,
+      });
       apiRef.log("error", "Failed to set power");
     }
   } catch (e) {
     cached.heating_state = prev;
-    apiRef.updateDeviceState(deviceId, { heating_state: prev, heating_mode: prev });
+    apiRef.updateDeviceState(deviceId, {
+      heating_state: prev,
+      heating_mode: prev,
+    });
     apiRef.log("error", "Set power failed: " + e.message);
   }
 }
