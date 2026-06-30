@@ -12,6 +12,16 @@ let maxTemp = 65;
 let cached = { temperature: null, target_temp: null, heating_state: null };
 let apiRef = null;
 
+// Adaptive polling state
+let plantId = null;
+let variant = null;
+let slowPollInterval = 1800;
+let fastPollInterval = 120;
+let cooldownCycles = 3;
+let cooldownRemaining = 0;
+let currentPollIntervalSec = 0;
+let prevHeatingState = null;
+
 function generateUUID(seed) {
   const crypto = require("crypto");
   const hash = crypto.createHash("sha256").update(seed).digest("hex");
@@ -32,7 +42,12 @@ module.exports = {
 
     minTemp = Math.max(1, Number(config.minTemp ?? 40));
     maxTemp = Math.max(minTemp + 1, Number(config.maxTemp ?? 65));
-    const pollInterval = Math.max(300, Number(config.pollInterval) || 1800);
+    slowPollInterval = Math.max(300, Number(config.pollInterval) || 1800);
+    fastPollInterval = Math.max(30, Number(config.fastPollInterval) || 120);
+    if (fastPollInterval >= slowPollInterval) {
+      fastPollInterval = Math.max(30, Math.floor(slowPollInterval / 2));
+    }
+    cooldownCycles = Math.max(1, Math.min(10, Number(config.cooldownCycles) || 3));
     const debug = !!config.debug;
 
     const seed = "ariston-heater-" + (config.gateway || config.username);
@@ -84,7 +99,7 @@ module.exports = {
       }
     });
 
-    initialize(pollInterval);
+    initialize();
   },
 
   setConfig(cfg) {
@@ -95,19 +110,25 @@ module.exports = {
       clearTimeout(retryTimer);
       retryTimer = null;
     }
-    if (pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-    }
+    stopPollTimer();
 
     // Reset state
     consecutiveFailures = 0;
     refreshInFlight = null;
+    plantId = null;
+    variant = null;
+    prevHeatingState = null;
+    cooldownRemaining = 0;
 
     // Recompute config-derived values
     minTemp = Math.max(1, Number(config.minTemp ?? 40));
     maxTemp = Math.max(minTemp + 1, Number(config.maxTemp ?? 65));
-    const pollInterval = Math.max(300, Number(config.pollInterval) || 1800);
+    slowPollInterval = Math.max(300, Number(config.pollInterval) || 1800);
+    fastPollInterval = Math.max(30, Number(config.fastPollInterval) || 120);
+    if (fastPollInterval >= slowPollInterval) {
+      fastPollInterval = Math.max(30, Math.floor(slowPollInterval / 2));
+    }
+    cooldownCycles = Math.max(1, Math.min(10, Number(config.cooldownCycles) || 3));
     const debug = !!config.debug;
 
     // Recreate device ID in case gateway/username changed
@@ -151,7 +172,7 @@ module.exports = {
       },
     });
 
-    initialize(pollInterval);
+    initialize();
   },
 
   stop() {
@@ -159,44 +180,94 @@ module.exports = {
       clearTimeout(retryTimer);
       retryTimer = null;
     }
-    if (pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-    }
-    pollTimer = null;
+    stopPollTimer();
     retryTimer = null;
     client = null;
   },
 };
 
-async function initialize(pollInterval) {
+// --- Adaptive Poll Timer ---
+
+function stopPollTimer() {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+  currentPollIntervalSec = 0;
+}
+
+function startPollTimer(intervalSec) {
+  if (!plantId || !variant) return;
+  if (currentPollIntervalSec === intervalSec && pollTimer) return; // already running at this rate
+
+  stopPollTimer();
+  currentPollIntervalSec = intervalSec;
+  pollTimer = setInterval(() => refresh(plantId, variant), intervalSec * 1000);
+  if (pollTimer.unref) pollTimer.unref();
+}
+
+function maybeAdjustPolling() {
+  const isHeating = cached.heating_state === 1;
+
+  if (isHeating) {
+    // Actively heating: use fast interval, keep cooldown primed
+    cooldownRemaining = cooldownCycles;
+    if (currentPollIntervalSec !== fastPollInterval) {
+      startPollTimer(fastPollInterval);
+      apiRef.log("info", "Heating active → fast polling (" + fastPollInterval + "s)");
+    }
+    return;
+  }
+
+  // Not heating
+  if (cooldownRemaining > 0) {
+    cooldownRemaining--;
+    if (currentPollIntervalSec !== fastPollInterval) {
+      startPollTimer(fastPollInterval);
+    }
+    if (cooldownRemaining === 0) {
+      startPollTimer(slowPollInterval);
+      apiRef.log("info", "Cooldown finished → slow polling (" + slowPollInterval + "s)");
+    }
+  } else if (currentPollIntervalSec !== slowPollInterval) {
+    startPollTimer(slowPollInterval);
+  }
+}
+
+function forceFastPoll(reason) {
+  cooldownRemaining = cooldownCycles;
+  if (currentPollIntervalSec !== fastPollInterval) {
+    startPollTimer(fastPollInterval);
+    apiRef.log("info", reason + " → fast polling (" + fastPollInterval + "s)");
+  }
+}
+
+// --- Core Logic ---
+
+async function initialize() {
   try {
     apiRef.log("info", "Initializing Ariston connection...");
     await client.init();
     await client.login();
     apiRef.log("info", "Login successful");
 
-    let plantId = config.gateway || null;
+    plantId = config.gateway || null;
     if (!plantId) {
       plantId = await client.discoverPlantId();
       if (!plantId) throw new Error("No Ariston device found");
       apiRef.log("info", "Discovered device: " + plantId);
     }
 
-    const variant = await client.discoverVariant(plantId);
+    variant = await client.discoverVariant(plantId);
     apiRef.log("info", "Using variant: " + variant);
 
     await refresh(plantId, variant);
-    pollTimer = setInterval(
-      () => refresh(plantId, variant),
-      pollInterval * 1000,
-    );
-    if (pollTimer.unref) pollTimer.unref();
-
-    apiRef.log("info", "Device ready");
+    // Start with slow polling; refresh → updateState → maybeAdjustPolling will switch to fast if needed
+    startPollTimer(slowPollInterval);
+    apiRef.log("info", "Device ready (slow poll " + slowPollInterval + "s, fast poll " + fastPollInterval + "s)");
   } catch (e) {
     apiRef.log("error", "Initialization failed: " + e.message);
-    retryTimer = setTimeout(() => initialize(pollInterval), 60000);
+    retryTimer = setTimeout(() => initialize(), 60000);
   }
 }
 
@@ -245,13 +316,24 @@ function updateState(data) {
   }
 
   if (typeof data.power === "boolean") {
-    cached.heating_state = data.power ? 1 : 0;
-    updates.heating_state = cached.heating_state;
-    updates.heating_mode = cached.heating_state;
+    const newHeatingState = data.power ? 1 : 0;
+    cached.heating_state = newHeatingState;
+    updates.heating_state = newHeatingState;
+    updates.heating_mode = newHeatingState;
   }
 
   if (Object.keys(updates).length > 0) {
     apiRef.updateDeviceState(deviceId, updates);
+  }
+
+  // Adjust polling rate based on heating state transitions
+  const justStartedHeating = prevHeatingState !== null && prevHeatingState === 0 && cached.heating_state === 1;
+  prevHeatingState = cached.heating_state;
+
+  if (justStartedHeating) {
+    forceFastPoll("Heating started");
+  } else {
+    maybeAdjustPolling();
   }
 }
 
@@ -267,11 +349,9 @@ async function setTargetTemp(newTemp) {
   cached.target_temp = newTemp;
   apiRef.updateDeviceState(deviceId, { target_temp: newTemp });
 
-  const plantId = config.gateway || null;
-  const variant = null; // will be resolved from cache
+  // Optimistically switch to fast polling since the heater may start heating
+  forceFastPoll("Command issued");
 
-  // We need plantId and variant. If not in config, we fetch them again.
-  // For simplicity, we use the stored plantId from config or re-discover
   try {
     await client.login();
     let pid = config.gateway || null;
@@ -284,6 +364,7 @@ async function setTargetTemp(newTemp) {
 
     const success = await client.setTemperature(pid, v, oldTemp, newTemp);
     if (success) {
+      // Refresh after a short delay to confirm the new state
       setTimeout(() => refreshIfReady(pid, v), 5000);
     } else {
       cached.target_temp = oldTemp;
@@ -307,6 +388,11 @@ async function setPower(on) {
     heating_state: cached.heating_state,
     heating_mode: cached.heating_state,
   });
+
+  // If turning ON, switch to fast polling in anticipation
+  if (on) {
+    forceFastPoll("Power turned ON");
+  }
 
   try {
     await client.login();

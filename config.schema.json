@@ -26,11 +26,26 @@
         "description": "If empty, auto-discovers the first available Velis/Lydos device."
       },
       "pollInterval": {
-        "title": "Poll Interval (seconds)",
+        "title": "Idle Poll Interval (seconds)",
         "type": "number",
         "default": 1800,
         "minimum": 300,
-        "description": "How often to refresh state from the cloud. Minimum 300 (5 min), default 1800 (30 min)."
+        "description": "How often to refresh state when the heater is idle (off, not heating). Default 1800 (30 min), minimum 300 (5 min)."
+      },
+      "fastPollInterval": {
+        "title": "Heating Poll Interval (seconds)",
+        "type": "number",
+        "default": 120,
+        "minimum": 30,
+        "description": "How often to refresh state when the heater is actively heating. Default 120 (2 min), minimum 30. Must be less than idle interval."
+      },
+      "cooldownCycles": {
+        "title": "Cooldown Cycles",
+        "type": "number",
+        "default": 3,
+        "minimum": 1,
+        "maximum": 10,
+        "description": "Number of fast-poll cycles to keep after heating stops before switching to idle interval. Catches thermal inertia."
       },
       "minTemp": {
         "title": "Minimum Target Temperature (°C)",
