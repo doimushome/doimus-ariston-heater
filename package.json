@@ -1,6 +1,6 @@
 {
   "name": "doimus-ariston-heater",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Doimus plugin for Ariston Velis/Lydos water heaters (Ariston NET)",
   "license": "MIT",
   "author": "Matteo Crippa",
