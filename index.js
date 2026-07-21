@@ -1,5 +1,9 @@
 const { AristonClient } = require("./client");
 
+function createLogger(api, prefix) {
+  return (level, msg) => api.log(level, `[${prefix}] ${msg}`);
+}
+
 let client = null;
 let deviceId = null;
 let pollTimer = null;
@@ -11,6 +15,7 @@ let minTemp = 40;
 let maxTemp = 65;
 let cached = { temperature: null, target_temp: null, heating_state: null };
 let apiRef = null;
+let log = null;
 
 // Adaptive polling state
 let plantId = null;
@@ -39,6 +44,7 @@ module.exports = {
   start(cfg, api) {
     config = cfg;
     apiRef = api;
+    log = createLogger(api, "Ariston");
 
     minTemp = Math.max(1, Number(config.minTemp ?? 40));
     maxTemp = Math.max(minTemp + 1, Number(config.maxTemp ?? 65));
@@ -60,11 +66,11 @@ module.exports = {
       username: config.username,
       password: config.password,
       log: {
-        info: (m) => api.log("info", m),
-        warn: (m) => api.log("warn", m),
-        error: (m) => api.log("error", m),
+        info: (m) => log("info", m),
+        warn: (m) => log("warn", m),
+        error: (m) => log("error", m),
         debug: (m) => {
-          if (debug) api.log("debug", m);
+          if (debug) log("debug", m);
         },
       },
       debug,
@@ -146,11 +152,11 @@ module.exports = {
       username: config.username,
       password: config.password,
       log: {
-        info: (m) => apiRef.log("info", m),
-        warn: (m) => apiRef.log("warn", m),
-        error: (m) => apiRef.log("error", m),
+        info: (m) => log("info", m),
+        warn: (m) => log("warn", m),
+        error: (m) => log("error", m),
         debug: (m) => {
-          if (debug) apiRef.log("debug", m);
+          if (debug) log("debug", m);
         },
       },
       debug,
@@ -220,7 +226,7 @@ function maybeAdjustPolling() {
     cooldownRemaining = cooldownCycles;
     if (currentPollIntervalSec !== fastPollInterval) {
       startPollTimer(fastPollInterval);
-      apiRef.log(
+      log(
         "info",
         "Heating active → fast polling (" + fastPollInterval + "s)",
       );
@@ -236,7 +242,7 @@ function maybeAdjustPolling() {
     }
     if (cooldownRemaining === 0) {
       startPollTimer(slowPollInterval);
-      apiRef.log(
+      log(
         "info",
         "Cooldown finished → slow polling (" + slowPollInterval + "s)",
       );
@@ -250,7 +256,7 @@ function forceFastPoll(reason) {
   cooldownRemaining = cooldownCycles;
   if (currentPollIntervalSec !== fastPollInterval) {
     startPollTimer(fastPollInterval);
-    apiRef.log("info", reason + " → fast polling (" + fastPollInterval + "s)");
+    log("info", reason + " → fast polling (" + fastPollInterval + "s)");
   }
 }
 
@@ -258,25 +264,25 @@ function forceFastPoll(reason) {
 
 async function initialize() {
   try {
-    apiRef.log("info", "Initializing Ariston connection...");
+    log("info", "Initializing Ariston connection...");
     await client.init();
     await client.login();
-    apiRef.log("info", "Login successful");
+    log("info", "Login successful");
 
     plantId = config.gateway || null;
     if (!plantId) {
       plantId = await client.discoverPlantId();
       if (!plantId) throw new Error("No Ariston device found");
-      apiRef.log("info", "Discovered device: " + plantId);
+      log("info", "Discovered device: " + plantId);
     }
 
     variant = await client.discoverVariant(plantId);
-    apiRef.log("info", "Using variant: " + variant);
+    log("info", "Using variant: " + variant);
 
     await refresh(plantId, variant);
     // Start with slow polling; refresh → updateState → maybeAdjustPolling will switch to fast if needed
     startPollTimer(slowPollInterval);
-    apiRef.log(
+    log(
       "info",
       "Device ready (slow poll " +
         slowPollInterval +
@@ -285,7 +291,7 @@ async function initialize() {
         "s)",
     );
   } catch (e) {
-    apiRef.log("error", "Initialization failed: " + e.message);
+    log("error", "Initialization failed: " + e.message);
     retryTimer = setTimeout(() => initialize(), 60000);
   }
 }
@@ -302,16 +308,16 @@ async function refresh(plantId, variant) {
         consecutiveFailures = 0;
       } else {
         consecutiveFailures++;
-        apiRef.log(
+        log(
           "warn",
           "Failed to get data (attempt " + consecutiveFailures + ")",
         );
       }
     } catch (e) {
       consecutiveFailures++;
-      apiRef.log("warn", "Refresh error: " + (e.message || e));
+      log("warn", "Refresh error: " + (e.message || e));
       const backoff = Math.min(300, 30 * consecutiveFailures);
-      apiRef.log("info", "Backing off for " + backoff + "s");
+      log("info", "Backing off for " + backoff + "s");
       await new Promise((r) => setTimeout(r, backoff * 1000));
     } finally {
       refreshInFlight = null;
@@ -370,7 +376,7 @@ async function setTargetTemp(newTemp) {
   if (!client) return;
   newTemp = Math.max(minTemp, Math.min(maxTemp, newTemp));
   const oldTemp = cached.target_temp || minTemp;
-  apiRef.log(
+  log(
     "info",
     "Setting temperature: " + oldTemp + "C -> " + newTemp + "C",
   );
@@ -398,18 +404,18 @@ async function setTargetTemp(newTemp) {
     } else {
       cached.target_temp = oldTemp;
       apiRef.updateDeviceState(deviceId, { target_temp: oldTemp });
-      apiRef.log("error", "Failed to set temperature");
+      log("error", "Failed to set temperature");
     }
   } catch (e) {
     cached.target_temp = oldTemp;
     apiRef.updateDeviceState(deviceId, { target_temp: oldTemp });
-    apiRef.log("error", "Set temperature failed: " + e.message);
+    log("error", "Set temperature failed: " + e.message);
   }
 }
 
 async function setPower(on) {
   if (!client) return;
-  apiRef.log("info", "Setting power: " + (on ? "ON" : "OFF"));
+  log("info", "Setting power: " + (on ? "ON" : "OFF"));
 
   const prev = cached.heating_state;
   cached.heating_state = on ? 1 : 0;
@@ -442,7 +448,7 @@ async function setPower(on) {
         heating_state: prev,
         heating_mode: prev,
       });
-      apiRef.log("error", "Failed to set power");
+      log("error", "Failed to set power");
     }
   } catch (e) {
     cached.heating_state = prev;
@@ -450,7 +456,7 @@ async function setPower(on) {
       heating_state: prev,
       heating_mode: prev,
     });
-    apiRef.log("error", "Set power failed: " + e.message);
+    log("error", "Set power failed: " + e.message);
   }
 }
 
