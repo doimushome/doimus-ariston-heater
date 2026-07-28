@@ -8,6 +8,7 @@ let client = null;
 let deviceId = null;
 let pollTimer = null;
 let retryTimer = null;
+let refreshTimer = null;
 let refreshInFlight = null;
 let consecutiveFailures = 0;
 let config = {};
@@ -86,6 +87,8 @@ module.exports = {
         "target_temp",
         "heating_state",
         "heating_mode",
+        "min_target_temp",
+        "max_target_temp",
       ],
       state: {
         temperature: 0,
@@ -173,6 +176,8 @@ module.exports = {
         "target_temp",
         "heating_state",
         "heating_mode",
+        "min_target_temp",
+        "max_target_temp",
       ],
       state: {
         temperature: 0,
@@ -191,6 +196,10 @@ module.exports = {
     if (retryTimer) {
       clearTimeout(retryTimer);
       retryTimer = null;
+    }
+    if (refreshTimer) {
+      clearTimeout(refreshTimer);
+      refreshTimer = null;
     }
     stopPollTimer();
     retryTimer = null;
@@ -441,7 +450,7 @@ async function setPower(on) {
 
     const success = await client.setPower(pid, v, on);
     if (success) {
-      setTimeout(() => refreshIfReady(pid, v), 5000);
+      refreshTimer = setTimeout(() => refreshIfReady(pid, v), 5000);
     } else {
       cached.heating_state = prev;
       apiRef.updateDeviceState(deviceId, {
