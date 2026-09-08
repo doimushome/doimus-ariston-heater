@@ -12,9 +12,6 @@ function createLogger(api, prefix) {
 const MODES = {
   sePlantData: { imemory: 1, green: 2, program: 6, boost: 7 },
   medPlantData: { program: 5, boost: 9 },
-  evoPlantData: { program: 5 },
-  slpPlantData: { program: 5 },
-  onePlantData: { program: 5 },
 };
 
 function modeValues(variant) {
@@ -374,15 +371,6 @@ async function initialize() {
     // Re-register with the variant-aware capabilities + UI descriptor.
     syncRegistration();
 
-    // Debug aid: dump raw plant settings so field names can be confirmed for
-    // the user's device model.
-    if (debug) {
-      client.getPlantSettings(plantId, variant).then(
-        (settings) => log("debug", "Plant settings: " + JSON.stringify(settings)),
-        (e) => log("debug", "Plant settings unavailable: " + e.message),
-      );
-    }
-
     await refresh(plantId, variant);
     // Start with slow polling; refresh → updateState → maybeAdjustPolling will switch to fast if needed
     startPollTimer(slowPollInterval);
@@ -553,36 +541,24 @@ async function setTargetTemp(newTemp) {
     "Setting temperature: " + oldTemp + "C -> " + newTemp + "C",
   );
 
-  cached.target_temp = newTemp;
-  apiRef.updateDeviceState(deviceId, { target_temp: newTemp });
-
   // Optimistically switch to fast polling since the heater may start heating
   forceFastPoll("Command issued");
 
-  try {
-    await client.login();
-    let pid = config.gateway || null;
-    if (!pid) pid = await client.discoverPlantId();
-    if (!pid) throw new Error("Cannot resolve plant ID");
-
-    const cachedVariant = client.storage.getVariant(pid);
-    const v = cachedVariant ? cachedVariant.variant : null;
-    if (!v) throw new Error("Cannot resolve variant");
-
-    const success = await client.setTemperature(pid, v, oldTemp, newTemp);
-    if (success) {
-      // Refresh after a short delay to confirm the new state
-      setTimeout(() => refreshIfReady(pid, v), 5000);
-    } else {
+  await applyWithRollback(
+    (pid, v) => client.setTemperature(pid, v, oldTemp, newTemp),
+    () => {
+      cached.target_temp = newTemp;
+      apiRef.updateDeviceState(deviceId, { target_temp: newTemp });
+    },
+    (e) => {
       cached.target_temp = oldTemp;
       apiRef.updateDeviceState(deviceId, { target_temp: oldTemp });
-      log("error", "Failed to set temperature");
-    }
-  } catch (e) {
-    cached.target_temp = oldTemp;
-    apiRef.updateDeviceState(deviceId, { target_temp: oldTemp });
-    log("error", "Set temperature failed: " + e.message);
-  }
+      log(
+        "error",
+        e ? "Set temperature failed: " + e.message : "Failed to set temperature",
+      );
+    },
+  );
 }
 
 async function setPower(on) {
@@ -590,33 +566,24 @@ async function setPower(on) {
   log("info", "Setting power: " + (on ? "ON" : "OFF"));
 
   const prev = cached.heating_state;
-  cached.heating_state = on ? 1 : 0;
-  cached.power = !!on;
-  apiRef.updateDeviceState(deviceId, {
-    power: cached.power,
-    heating_state: cached.heating_state,
-    heating_mode: cached.heating_state,
-  });
 
   // If turning ON, switch to fast polling in anticipation
   if (on) {
     forceFastPoll("Power turned ON");
   }
 
-  try {
-    await client.login();
-    let pid = config.gateway || null;
-    if (!pid) pid = await client.discoverPlantId();
-    if (!pid) throw new Error("Cannot resolve plant ID");
-
-    const cachedVariant = client.storage.getVariant(pid);
-    const v = cachedVariant ? cachedVariant.variant : null;
-    if (!v) throw new Error("Cannot resolve variant");
-
-    const success = await client.setPower(pid, v, on);
-    if (success) {
-      refreshTimer = setTimeout(() => refreshIfReady(pid, v), 5000);
-    } else {
+  await applyWithRollback(
+    (pid, v) => client.setPower(pid, v, on),
+    () => {
+      cached.heating_state = on ? 1 : 0;
+      cached.power = !!on;
+      apiRef.updateDeviceState(deviceId, {
+        power: cached.power,
+        heating_state: cached.heating_state,
+        heating_mode: cached.heating_state,
+      });
+    },
+    (e) => {
       cached.heating_state = prev;
       cached.power = prev === 1;
       apiRef.updateDeviceState(deviceId, {
@@ -624,18 +591,9 @@ async function setPower(on) {
         heating_state: prev,
         heating_mode: prev,
       });
-      log("error", "Failed to set power");
-    }
-  } catch (e) {
-    cached.heating_state = prev;
-    cached.power = prev === 1;
-    apiRef.updateDeviceState(deviceId, {
-      power: cached.power,
-      heating_state: prev,
-      heating_mode: prev,
-    });
-    log("error", "Set power failed: " + e.message);
-  }
+      log("error", e ? "Set power failed: " + e.message : "Failed to set power");
+    },
+  );
 }
 
 // Turns one of the mode toggles on/off. iMemory / Green / Scheduled / Boost are
@@ -664,50 +622,38 @@ async function setMode(newMode) {
 
   const prevMode = cached.mode;
   const m = modeValues(variant);
-  cached.mode = newMode;
-  if (cached.mode !== m.boost) cached.lastMode = cached.mode;
-  cached.boost = newMode === m.boost;
-  cached.imemory = newMode === m.imemory;
-  cached.scheduled = newMode === m.scheduled;
-  cached.green = newMode === m.green;
-  apiRef.updateDeviceState(deviceId, {
-    mode: newMode,
-    boost: cached.boost,
-    imemory: cached.imemory,
-    scheduled: cached.scheduled,
-    green: cached.green,
-  });
 
-  try {
-    await client.login();
-    let pid = config.gateway || null;
-    if (!pid) pid = await client.discoverPlantId();
-    if (!pid) throw new Error("Cannot resolve plant ID");
-
-    const cachedVariant = client.storage.getVariant(pid);
-    const v = cachedVariant ? cachedVariant.variant : null;
-    if (!v) throw new Error("Cannot resolve variant");
-
-    const success = await client.setMode(pid, v, newMode);
-    if (success) {
-      refreshTimer = setTimeout(() => refreshIfReady(pid, v), 5000);
-    } else {
+  await applyWithRollback(
+    (pid, v) => client.setMode(pid, v, newMode),
+    () => {
+      syncModeFlags(newMode);
+      if (cached.mode !== m.boost) cached.lastMode = cached.mode;
+      apiRef.updateDeviceState(deviceId, {
+        mode: newMode,
+        boost: cached.boost,
+        imemory: cached.imemory,
+        scheduled: cached.scheduled,
+        green: cached.green,
+      });
+    },
+    (e) => {
       restoreMode(prevMode);
-      log("error", "Failed to set mode");
-    }
-  } catch (e) {
-    restoreMode(prevMode);
-    log("error", "Set mode failed: " + e.message);
-  }
+      log("error", e ? "Set mode failed: " + e.message : "Failed to set mode");
+    },
+  );
 }
 
-function restoreMode(mode) {
+function syncModeFlags(mode) {
   const m = modeValues(variant);
   cached.mode = mode;
   cached.boost = mode === m.boost;
   cached.imemory = mode === m.imemory;
   cached.scheduled = mode === m.scheduled;
   cached.green = mode === m.green;
+}
+
+function restoreMode(mode) {
+  syncModeFlags(mode);
   apiRef.updateDeviceState(deviceId, {
     mode: mode,
     boost: cached.boost,
@@ -717,6 +663,29 @@ function restoreMode(mode) {
   });
 }
 
-async function refreshIfReady(plantId, variant) {
-  if (plantId && variant) await refresh(plantId, variant);
+async function applyWithRollback(fn, optimisticState, rollbackState) {
+  optimisticState();
+  let pid, v;
+  try {
+    await client.login();
+    pid = config.gateway || null;
+    if (!pid) pid = await client.discoverPlantId();
+    if (!pid) throw new Error("Cannot resolve plant ID");
+
+    const cachedVariant = client.storage.getVariant(pid);
+    v = cachedVariant ? cachedVariant.variant : null;
+    if (!v) throw new Error("Cannot resolve variant");
+
+    const success = await fn(pid, v);
+    if (success) {
+      refreshTimer = setTimeout(() => {
+        if (pid && v) refresh(pid, v);
+      }, 5000);
+    } else {
+      rollbackState(null);
+    }
+  } catch (e) {
+    rollbackState(e);
+  }
 }
+

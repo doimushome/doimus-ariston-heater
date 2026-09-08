@@ -1,9 +1,7 @@
-const axios = require("axios");
 const { VariantStorage } = require("./storage");
 
 const API_BASE = "https://www.ariston-net.remotethermo.com/api/v2/";
 const DEFAULT_TIMEOUT_MS = 30000;
-const DEFAULT_FALLBACK_TTL_MS = 2 * 60 * 1000;
 const VARIANTS = [
   "sePlantData",
   "medPlantData",
@@ -21,48 +19,9 @@ class AristonClient {
     this.token = null;
     this.loginPromise = null;
     this.initPromise = null;
-    this.memoryCache = new Map();
+    this.baseURL = opts.baseURL || API_BASE;
 
     this.storage = new VariantStorage(opts.cacheDir, this.log);
-
-    this.http = axios.create({
-      baseURL: opts.baseURL || API_BASE,
-      timeout: DEFAULT_TIMEOUT_MS,
-      headers: {
-        "User-Agent": "okhttp/4.9.3",
-        "Content-Type": "application/json",
-      },
-      validateStatus: () => true,
-    });
-
-    this.http.interceptors.request.use((config) => {
-      if (this.token) {
-        if (!config.headers) config.headers = {};
-        config.headers["ar.authToken"] = this.token;
-      }
-      return config;
-    });
-
-    this.http.interceptors.response.use(
-      (res) => res,
-      async (error) => {
-        const { config, response } = error;
-        if (
-          response &&
-          response.status === 401 &&
-          config &&
-          !config._retry &&
-          !(config.url && config.url.includes("accounts/login"))
-        ) {
-          config._retry = true;
-          await this.login();
-          config.headers = config.headers || {};
-          config.headers["ar.authToken"] = this.token;
-          return this.http.request(config);
-        }
-        return Promise.reject(error);
-      },
-    );
   }
 
   async init() {
@@ -77,10 +36,51 @@ class AristonClient {
     }
   }
 
+  async _request(method, url, body, isRetry = false) {
+    const headers = {
+      "User-Agent": "okhttp/4.9.3",
+      "Content-Type": "application/json",
+    };
+    if (this.token) headers["ar.authToken"] = this.token;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+
+    let res;
+    try {
+      res = await fetch(this.baseURL + url, {
+        method,
+        headers,
+        body: body ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+    } catch (e) {
+      clearTimeout(timeoutId);
+      if (e.name === "AbortError") {
+        return { status: 0, statusText: "Timeout", data: null };
+      }
+      throw e;
+    }
+    clearTimeout(timeoutId);
+
+    if (res.status === 401 && !isRetry && !url.includes("accounts/login")) {
+      await this.login();
+      return this._request(method, url, body, true);
+    }
+
+    let data = null;
+    try {
+      data = await res.json();
+    } catch (e) {
+      // Response body is not JSON
+    }
+    return { status: res.status, statusText: res.statusText, data };
+  }
+
   async login() {
     if (this.loginPromise) return this.loginPromise;
     this.loginPromise = (async () => {
-      const res = await this.http.post("accounts/login", {
+      const res = await this._request("POST", "accounts/login", {
         usr: this.username,
         pwd: this.password,
         imp: false,
@@ -110,7 +110,7 @@ class AristonClient {
   async discoverPlantId() {
     await this.login();
     for (const p of ["velis/medPlants", "velis/plants"]) {
-      const res = await this.http.get(p);
+      const res = await this._request("GET", p);
       if (
         res.status >= 200 &&
         res.status < 300 &&
@@ -135,7 +135,7 @@ class AristonClient {
     for (const variant of VARIANTS) {
       try {
         const url = "velis/" + variant + "/" + encodeURIComponent(plantId);
-        const res = await this.http.get(url);
+        const res = await this._request("GET", url);
         if (
           res.status >= 200 &&
           res.status < 300 &&
@@ -165,26 +165,15 @@ class AristonClient {
   async getPlantData(plantId, variant) {
     await this.login();
     const url = "velis/" + variant + "/" + encodeURIComponent(plantId);
-    const res = await this.http.get(url);
+    const res = await this._request("GET", url);
     if (res.status >= 200 && res.status < 300) {
       if (!res.data || typeof res.data !== "object") return null;
-      const parsed = this._parsePlantData(res.data, variant);
-      this.memoryCache.set(plantId + "::" + variant, {
-        data: parsed,
-        ts: Date.now(),
-      });
-      return parsed;
+      return this._parsePlantData(res.data, variant);
     }
     if (res.status === 429 || res.status >= 500) {
       this.log.warn("API transient error; returning cached data if available");
-      const entry = this.memoryCache.get(plantId + "::" + variant);
-      if (entry && Date.now() - entry.ts <= DEFAULT_FALLBACK_TTL_MS)
-        return entry.data;
       return null;
     }
-    const entry = this.memoryCache.get(plantId + "::" + variant);
-    if (entry && Date.now() - entry.ts <= DEFAULT_FALLBACK_TTL_MS)
-      return entry.data;
     return null;
   }
 
@@ -192,7 +181,7 @@ class AristonClient {
     await this.login();
     const url =
       "velis/" + variant + "/" + encodeURIComponent(plantId) + "/temperature";
-    const res = await this.http.post(url, {
+    const res = await this._request("POST", url, {
       eco: false,
       old: oldTemp,
       new: newTemp,
@@ -204,46 +193,15 @@ class AristonClient {
     await this.login();
     const url =
       "velis/" + variant + "/" + encodeURIComponent(plantId) + "/switch";
-    const res = await this.http.post(url, on);
+    const res = await this._request("POST", url, on);
     return res.status >= 200 && res.status < 300;
   }
 
-  // Reads the device's plant settings (anti-legionella, permanent boost, night
-  // mode, max setpoint, ...). Returns null when the endpoint is unavailable.
-  async getPlantSettings(plantId, variant) {
-    await this.login();
-    const url =
-      "velis/" + variant + "/" + encodeURIComponent(plantId) + "/plantSettings";
-    const res = await this.http.get(url);
-    if (
-      res.status >= 200 &&
-      res.status < 300 &&
-      res.data &&
-      typeof res.data === "object"
-    ) {
-      return res.data;
-    }
-    return null;
-  }
-
-  // Sets a single plant setting. oldValue is the value currently reported by
-  // the device (the API rejects optimistic writes without it).
-  async setPlantSetting(plantId, variant, name, value, oldValue) {
-    await this.login();
-    const url =
-      "velis/" + variant + "/" + encodeURIComponent(plantId) + "/plantSettings";
-    const res = await this.http.post(url, {
-      [name]: { new: value, old: oldValue },
-    });
-    return res.status >= 200 && res.status < 300;
-  }
-
-  // Sets the water heater operating mode (iMemory / Green / Program / Boost).
   async setMode(plantId, variant, mode) {
     await this.login();
     const url =
       "velis/" + variant + "/" + encodeURIComponent(plantId) + "/mode";
-    const res = await this.http.post(url, { new: mode });
+    const res = await this._request("POST", url, { new: mode });
     return res.status >= 200 && res.status < 300;
   }
 
