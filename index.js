@@ -77,7 +77,7 @@ function generateUUID(seed) {
 }
 
 function buildCapabilities() {
-  const caps = ["power", "target_temp", "heating_state", "heating_mode", "mode"];
+  const caps = ["power", "target_temp", "heating_state", "mode"];
   const m = modeValues(variant);
   if (m.boost !== undefined) caps.push("boost");
   if (m.imemory !== undefined) caps.push("imemory");
@@ -128,9 +128,7 @@ function buildDescriptor() {
 function currentStateSnapshot() {
   const state = {
     power: !!cached.power,
-    heating: !!cached.heating,
     heating_state: cached.heating_state ?? 0,
-    heating_mode: cached.heating_state ?? 0,
     temperature: cached.temperature ?? 0,
     target_temp: cached.target_temp ?? minTemp,
     min_target_temp: minTemp,
@@ -214,9 +212,6 @@ module.exports = {
           break;
         case "power":
           setPower(value === true || value === 1 || value === "1" || value === "true");
-          break;
-        case "heating_mode":
-          setPower(value === 1 || value === true);
           break;
         case "boost":
           setModeToggle("boost", isTruthy(value));
@@ -466,22 +461,14 @@ function updateState(data) {
   }
 
   // Cloud reports `heatReq` when the heating element is actively running.
-  // Surface both the boolean (`heating`) and numeric (`heating_state`,
-  // `heating_mode`) forms so the mobile dashboard's predicate matches the
-  // documented thermostat contract.
+  // Surface the numeric `heating_state` form so the mobile dashboard's
+  // predicate matches the documented thermostat contract.
   if (data.heatReq !== undefined && data.heatReq !== null) {
     const newHeating = !!data.heatReq;
     const newHeatingState = newHeating ? 1 : 0;
-    if (
-      cached.heating_state !== newHeatingState ||
-      cached.heating !== newHeating
-    ) {
-      cached.heating = newHeating;
+    if (cached.heating_state !== newHeatingState) {
       cached.heating_state = newHeatingState;
-      cached.heating_mode = newHeatingState;
-      updates.heating = newHeating;
       updates.heating_state = newHeatingState;
-      updates.heating_mode = newHeatingState;
     }
   }
 
@@ -580,7 +567,6 @@ async function setPower(on) {
       apiRef.updateDeviceState(deviceId, {
         power: cached.power,
         heating_state: cached.heating_state,
-        heating_mode: cached.heating_state,
       });
     },
     (e) => {
@@ -589,7 +575,6 @@ async function setPower(on) {
       apiRef.updateDeviceState(deviceId, {
         power: cached.power,
         heating_state: prev,
-        heating_mode: prev,
       });
       log("error", e ? "Set power failed: " + e.message : "Failed to set power");
     },
